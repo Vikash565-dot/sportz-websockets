@@ -7,7 +7,6 @@ import {
 	timestamp,
 	jsonb,
 } from "drizzle-orm/pg-core";
-import { defaultNow } from "drizzle-orm";
 
 // Enum for match lifecycle
 export const matchStatusEnum = pgEnum("match_status", [
@@ -26,9 +25,7 @@ export const matches = pgTable("matches", {
 	endTime: timestamp("end_time", { withTimezone: true }),
 	homeScore: integer("home_score").notNull().default(0),
 	awayScore: integer("away_score").notNull().default(0),
-	createdAt: timestamp("created_at", { withTimezone: true })
-		.default(defaultNow())
-		.notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
 export const commentary = pgTable("commentary", {
@@ -45,8 +42,6 @@ export const commentary = pgTable("commentary", {
 	message: text("message"),
 	metadata: jsonb("metadata"),
 	tags: text("tags").array(),
-	createdAt: timestamp("created_at", { withTimezone: true })
-		.default(defaultNow())
-		.notNull(),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
