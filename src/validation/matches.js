@@ -1,13 +1,7 @@
 import { z } from "zod";
 
-// Accept ISO-like strings with or without milliseconds; still requires a valid date
-const isIsoDateString = (value) => {
-  if (typeof value !== "string") return false;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return false;
-  // basic ISO-8601 shape check (YYYY-MM-DDTHH:MM:SS(.mmm)?Z)
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(value);
-};
+// Shared ISO 8601 datetime validator (with timezone) used by match payloads
+const isoDateString = z.iso.datetime();
 
 export const MATCH_STATUS = {
   SCHEDULED: "scheduled",
@@ -32,12 +26,8 @@ export const createMatchSchema = z
     sport: z.string().trim().min(1),
     homeTeam: z.string().trim().min(1),
     awayTeam: z.string().trim().min(1),
-    startTime: z
-      .string()
-      .refine((value) => isIsoDateString(value), "startTime must be a valid ISO date string"),
-    endTime: z
-      .string()
-      .refine((value) => isIsoDateString(value), "endTime must be a valid ISO date string"),
+    startTime: isoDateString,
+    endTime: isoDateString,
     homeScore: z.coerce.number().int().nonnegative().optional(),
     awayScore: z.coerce.number().int().nonnegative().optional(),
   })
