@@ -129,6 +129,10 @@ export function attachWebSocketServer(server) {
         socket.on('error', console.error);
     });
 
+    wss.on('error', (error) => {
+        console.error('WebSocket server error:', error.message);
+    });
+
     const interval = setInterval(() => {
         wss.clients.forEach((ws) => {
             if(ws.isAlive === false) return ws.terminate();
