@@ -7,10 +7,21 @@ import {
     listCommentaryQuerySchema,
 } from "../../validation/commentary.js";
 import { desc, eq } from "drizzle-orm";
+import {
+    bumpCacheVersion,
+    getCacheVersion,
+    getOrSetJson,
+} from "../../redis.js";
 
 export const commentaryRouter = Router({ mergeParams: true });
 
 const MAX_LIMIT = 100;
+
+function commentaryCacheTtl(commentaryList) {
+    const newest = commentaryList[0]?.createdAt;
+    if (newest && Date.now() - new Date(newest).getTime() < 2 * 60 * 1000) return 5;
+    return 30;
+}
 
 commentaryRouter.get("/", async (req, res) => {
     const paramsResult = matchParamSchema.safeParse(req.params);
@@ -31,13 +42,18 @@ commentaryRouter.get("/", async (req, res) => {
     const limit = Math.min(queryResult.data.limit ?? 100, MAX_LIMIT);
 
     try {
-        const data = await db
-            .select()
-            .from(commentary)
-            .where(eq(commentary.matchId, matchId))
-            .orderBy(desc(commentary.createdAt))
-            .limit(limit);
+        const version = await getCacheVersion(`commentary:match:${matchId}`);
+        const cacheKey = `commentary:match:${matchId}:v${version}:limit:${limit}`;
+        const { data, cacheStatus } = await getOrSetJson(cacheKey, commentaryCacheTtl, () =>
+            db
+                .select()
+                .from(commentary)
+                .where(eq(commentary.matchId, matchId))
+                .orderBy(desc(commentary.createdAt))
+                .limit(limit)
+        );
 
+        res.set("X-Cache", cacheStatus);
         return res.json({ data });
     } catch (e) {
         console.error("Failed to list commentary", e);
@@ -93,6 +109,9 @@ commentaryRouter.post("/", async (req, res) => {
         if (res.app.locals.broadcastCommentary) {
             res.app.locals.broadcastCommentary(entry.matchId, entry);
         }
+
+        // Cache invalidation must not add latency to the live WebSocket event path.
+        void bumpCacheVersion(`commentary:match:${matchId}`);
 
         return res.status(201).json({ data: entry });
     } catch (e) {
