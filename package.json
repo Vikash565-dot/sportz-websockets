@@ -4,7 +4,13 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node  --watch src/index.js",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev:api\" \"npm run web:dev\"",
+    "dev:api": "node --watch src/index.js",
+    "dev:all": "npm run dev",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "web:start": "npm --prefix web run start",
+    "test": "node --test",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:demo": "node src/drizzle-crud.js"
@@ -21,12 +27,14 @@
     "dotenv": "^17.3.1",
     "drizzle-orm": "^0.45.1",
     "express": "^5.2.1",
+    "kafkajs": "^2.2.4",
     "pg": "^8.20.0",
     "redis": "^6.2.0",
     "ws": "^8.19.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "concurrently": "^9.2.1",
     "drizzle-kit": "^0.31.9"
   }
 }

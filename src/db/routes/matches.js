@@ -10,6 +10,9 @@ import {
   getCacheVersion,
   getOrSetJson,
 } from "../../redis.js";
+import { createMatchInStore, listMatches } from "../fallback-store.js";
+import { matchCreatedEvent } from "../../kafka/events.js";
+import { enqueueOutboxEvent, flushOutboxEvents } from "../../kafka/outbox.js";
 
 export const matchesRouter = Router();
 
@@ -34,13 +37,18 @@ matchesRouter.get("/", async  (req, res) => {
     const version = await getCacheVersion("matches:list");
     const cacheKey = `matches:list:v${version}:limit:${limit}`;
     const { data, cacheStatus } = await getOrSetJson(cacheKey, matchesCacheTtl, async () => {
-      const matchesList = await db
-        .select()
-        .from(matches)
-        .orderBy(desc(matches.createdAt))
-        .limit(limit);
+      try {
+        const matchesList = await db
+          .select()
+          .from(matches)
+          .orderBy(desc(matches.createdAt))
+          .limit(limit);
 
-      return matchesList;
+        return matchesList;
+      } catch (dbError) {
+        console.warn("Database unavailable for matches, using fallback store", dbError.message);
+        return listMatches(limit);
+      }
     });
 
     res.set("X-Cache", cacheStatus);
@@ -61,20 +69,45 @@ matchesRouter.post("/", async (req, res) => {
   const { startTime, endTime, homeScore, awayScore } = parsed.data;
 
   try {
-    const [event] = await db
-      .insert(matches)
-      .values({
+    let event;
+    let persistedInPostgres = true;
+
+    try {
+      event = await db.transaction(async (tx) => {
+        const [createdMatch] = await tx
+          .insert(matches)
+          .values({
+            ...parsed.data,
+            startTime: new Date(startTime),
+            endTime: new Date(endTime),
+            homeScore: homeScore ?? 0,
+            awayScore: awayScore ?? 0,
+            status: getMatchStatus(startTime, endTime),
+          })
+          .returning();
+
+        await enqueueOutboxEvent(tx, matchCreatedEvent(createdMatch));
+        return createdMatch;
+      });
+    } catch (dbError) {
+      console.warn("Database unavailable for match creation, using fallback store", dbError.message);
+      persistedInPostgres = false;
+      event = await createMatchInStore({
         ...parsed.data,
-        startTime: new Date(startTime),
-        endTime: new Date(endTime),
+        startTime,
+        endTime,
         homeScore: homeScore ?? 0,
         awayScore: awayScore ?? 0,
         status: getMatchStatus(startTime, endTime),
-      })
-      .returning();
+      });
+    }
 
-      if(res.app.locals.broadcastMatchCreated){
-        res.app.locals.broadcastMatchCreated(event);
+      if (persistedInPostgres) {
+        // The relay publishes only committed outbox rows; a Kafka outage cannot lose this event.
+        void flushOutboxEvents().catch((error) => console.error("Outbox flush failed:", error.message));
+      } else if (res.app.locals.broadcastMatchCreated) {
+        // The in-memory fallback cannot participate in a database transaction.
+        await res.app.locals.broadcastMatchCreated(event);
       }
 
       // Cache invalidation must not add latency to the live WebSocket event path.

@@ -1,1 +1,1 @@
-{"version":"7","dialect":"postgresql","entries":[]}
+{"version":"7","dialect":"postgresql","entries":[{"idx":0,"version":"7","when":1786640000000,"tag":"0000_kafka_outbox","breakpoints":true}]}

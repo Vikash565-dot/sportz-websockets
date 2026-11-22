@@ -1,36 +1,6 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import {wsArcjet} from "../arcjet.js";
-
-const matchSubscribers = new Map();
-
-function subscribe(matchId, socket) {
-    if(!matchSubscribers.has(matchId)){
-        matchSubscribers.set(matchId, new Set())
-    }
-
-    matchSubscribers.get(matchId).add(socket);
-}
-
-
-function unsubscribe(matchId, socket) {
-    const subscribers = matchSubscribers.get(matchId);
-    if(!subscribers) return;
-
-    subscribers.delete(socket);
-
-    if(subscribers.size === 0){
-        matchSubscribers.delete(matchId);
-
-    }
-}
-
-function cleanupSubscriptions(socket){
-    for(const matchId of socket.subscriptions) {
-        unsubscribe(matchId, socket);
-    }
-}
-
-
+import { connectRedisPubSub, publishWsEvent } from "../redis.js";
 
 function sendJson(socket, payload) {
   if (socket.readyState !== WebSocket.OPEN) return ;
@@ -44,46 +14,86 @@ function broadcastToAll(wss, payload) {
   }
 }
 
-function broadcastToMatch(matchId, payload) {
-    const subscribers = matchSubscribers.get(matchId);
-    if(!subscribers || subscribers.size === 0) return;
+export function createMatchSubscriptionRegistry() {
+  const matchSubscribers = new Map();
 
-    const message = JSON.stringify(payload);
-
-    for(const client of subscribers){
-        if(client.readyState !== WebSocket.OPEN) continue;
-        client.send(message);
-    }
+  return {
+    subscribe(matchId, socket) {
+      if (!matchSubscribers.has(matchId)) matchSubscribers.set(matchId, new Set());
+      matchSubscribers.get(matchId).add(socket);
+    },
+    unsubscribe(matchId, socket) {
+      const subscribers = matchSubscribers.get(matchId);
+      if (!subscribers) return;
+      subscribers.delete(socket);
+      if (subscribers.size === 0) matchSubscribers.delete(matchId);
+    },
+    cleanup(socket) {
+      for (const matchId of socket.subscriptions) this.unsubscribe(matchId, socket);
+    },
+    broadcast(matchId, payload) {
+      const subscribers = matchSubscribers.get(matchId);
+      if (!subscribers || subscribers.size === 0) return;
+      const message = JSON.stringify(payload);
+      for (const client of subscribers) {
+        if (client.readyState === WebSocket.OPEN) client.send(message);
+      }
+    },
+  };
 }
 
-function handleMessage(socket, data){
+function handleMessage(registry, socket, data){
     let message;
 
     try{
         message = JSON.parse(data.toString())
     } catch {
         sendJson(socket, { type: 'error', message: 'Invalid JSON' });
+            return;
     }
     if(message?.type === "subscribe" && Number.isInteger(message.matchId)){
-      subscribe(message.matchId, socket);
+      registry.subscribe(message.matchId, socket);
         socket.subscriptions.add(message.matchId);
         sendJson(socket, { type: 'subscribed', matchId: message.matchId });
         return ;
     }
 
     if(message?.type === "unsubscribe" && Number.isInteger(message.matchId)){
-        unsubscribe(message.matchId, socket);
+        registry.unsubscribe(message.matchId, socket);
         socket.subscriptions.delete(message.matchId);
         sendJson(socket, { type: 'unsubscribed', matchId: message.matchId });
     }
 }
 
 export function attachWebSocketServer(server) {
+    const subscriptions = createMatchSubscriptionRegistry();
     const wss = new WebSocketServer({
         server,
         path: '/ws',
         maxPayload: 1024 * 1024, // 1MB
     });
+
+        void connectRedisPubSub((rawEvent) => {
+            try {
+                const event = JSON.parse(rawEvent);
+
+                if (event?.type === "match_created") {
+                    broadcastToAll(wss, event);
+                    return;
+                }
+
+                if (event?.type === "commentary" && Number.isInteger(event.matchId)) {
+                    subscriptions.broadcast(event.matchId, event);
+                    return;
+                }
+
+                if (event?.type === "match_updated" && Number.isInteger(event?.data?.id)) {
+                    subscriptions.broadcast(event.data.id, event);
+                }
+            } catch (error) {
+                console.error("Failed to process websocket pub/sub event:", error.message);
+            }
+        });
 
     wss.on('connection',async (socket, req) => {
 
@@ -116,14 +126,14 @@ export function attachWebSocketServer(server) {
 
         sendJson(socket, { type: 'welcome' });
 
-        socket.on('message', (data) => handleMessage(socket, data));
+        socket.on('message', (data) => handleMessage(subscriptions, socket, data));
 
         socket.on('error', ()=> {
             socket.terminate();
         })
 
         socket.on('close', () => {
-            cleanupSubscriptions(socket);
+            subscriptions.cleanup(socket);
         })
 
         socket.on('error', console.error);
@@ -142,15 +152,39 @@ export function attachWebSocketServer(server) {
 
         })
     }, 30000);
-    wss.on('close', () => clearinterval(interval));
+    wss.on('close', () => clearInterval(interval));
 
-    function broadcastMatchCreated(match) {
-        broadcastToAll(wss, { type: 'match_created', data: match });
+    async function broadcastMatchCreated(match) {
+        const payload = { type: 'match_created', data: match };
+
+        if (!(await publishWsEvent(payload))) {
+            broadcastToAll(wss, payload);
+        }
     }
 
-    function broadcastCommentary(matchId, commentary) {
-        broadcastToMatch(matchId, { type: 'commentary', data: commentary });
+    async function broadcastMatchUpdated(match) {
+        const payload = { type: 'match_updated', data: match };
+
+        if (!(await publishWsEvent(payload))) {
+            subscriptions.broadcast(match.id, payload);
+        }
     }
 
-    return { broadcastMatchCreated, broadcastCommentary };
+    async function broadcastCommentary(matchId, commentary) {
+        const payload = { type: 'commentary', matchId, data: commentary };
+
+        if (!(await publishWsEvent(payload))) {
+            subscriptions.broadcast(matchId, payload);
+        }
+    }
+
+    return {
+      broadcastMatchCreated,
+      broadcastMatchUpdated,
+      broadcastCommentary,
+      closeWebSocketServer: () => new Promise((resolve) => {
+        for (const client of wss.clients) client.terminate();
+        wss.close(resolve);
+      }),
+    };
 }
