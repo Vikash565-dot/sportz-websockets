@@ -45,3 +45,18 @@ export const commentary = pgTable("commentary", {
 	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
+// The outbox is committed with a domain write, then relayed to Kafka separately.
+export const outboxEvents = pgTable("outbox_events", {
+	id: text("id").primaryKey(),
+	topic: text("topic").notNull(),
+	messageKey: text("message_key").notNull(),
+	payload: jsonb("payload").notNull(),
+	attempts: integer("attempts").notNull().default(0),
+	nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow().notNull(),
+	lockedAt: timestamp("locked_at", { withTimezone: true }),
+	lockedBy: text("locked_by"),
+	publishedAt: timestamp("published_at", { withTimezone: true }),
+	lastError: text("last_error"),
+	createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+

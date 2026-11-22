@@ -2,7 +2,7 @@
 
 A production-oriented backend for **real-time sports broadcasting**, built with Node.js, Express, WebSockets, PostgreSQL, Drizzle ORM, Redis, and Arcjet.
 
-The system provides REST APIs for managing matches and play-by-play commentary while using **match-scoped WebSocket broadcasting** to stream live events to concurrent clients. It also implements dynamic Redis caching, API protection, rate limiting, and performance monitoring.
+The system provides REST APIs for managing matches and play-by-play commentary while using **match-scoped WebSocket broadcasting** to stream live events to concurrent clients. It also implements dynamic Redis caching, Redis pub/sub fan-out for multi-instance websocket delivery, API protection, rate limiting, and performance monitoring.
 
 > Redis optimizes read-heavy API requests only. PostgreSQL remains the source of truth, while WebSocket broadcasts stay outside the cache delivery path.
 
@@ -108,6 +108,85 @@ Redis invalidation is deliberately performed asynchronously after broadcasting s
 | Security         | Arcjet                              |
 | Monitoring / APM | Site24x7                            |
 | Load testing     | Concurrent WebSocket stress testing |
+
+## Apache Kafka Architecture
+
+Kafka is the event-streaming backbone for persisted sports events. PostgreSQL remains the source of truth and Redis remains the cache; neither is replaced by Kafka.
+
+```text
+Client
+  ↓
+Express API + Zod validation
+  ↓
+PostgreSQL (source of truth)
+  ↓
+Kafka producer → match-events
+  ↓
+Kafka consumer group: sportz-websocket
+  ↓
+Existing WebSocket server → subscribers for that match
+```
+
+The API publishes generic, validated event envelopes, so the same topic supports football goals, cricket fours, basketball points, and other sports without introducing sport-specific database fields:
+
+```json
+{
+  "eventId": "uuid",
+  "eventType": "COMMENTARY_CREATED",
+  "sport": "football",
+  "matchId": "123",
+  "timestamp": "2026-08-13T12:00:00.000Z",
+  "payload": { "type": "COMMENTARY_CREATED", "commentary": {} }
+}
+```
+
+### Why Kafka?
+
+Kafka decouples the API from downstream processing. Today `sportz-websocket` consumes `match-events` to deliver WebSocket updates. Later, independent `sportz-analytics` or `sportz-notifications` consumer groups can consume the same durable stream without changing the API.
+
+Apache Kafka is the event-streaming platform; KafkaJS is the Node.js client used by this application to communicate with it.
+
+### Why Redis and Kafka?
+
+Redis answers “give me cached data quickly.” The existing cache-aside reads, TTLs, versioned cache keys, invalidation, fallback behavior, and Redis Pub/Sub WebSocket fan-out are unchanged.
+
+Kafka answers “an event happened; let independent consumers process it.” It provides topics, partitions, consumer groups, and a durable log that can be replayed by a consumer group. Redis Pub/Sub is retained for the application's current cross-process WebSocket fan-out, but it is not the durable event stream.
+
+### Kafka topic, key, and consumer group
+
+The generic topic is `match-events`. Each event uses `String(matchId)` as its Kafka key, which consistently maps events for the same match to the same partition and preserves their order within that partition. Kafka does not provide global ordering across all matches.
+
+`sportz-websocket` is the WebSocket delivery consumer group. Other groups can consume the same topic independently. The consumer validates every JSON message with Zod; malformed messages are logged and skipped without crashing the consumer.
+
+### Local Kafka (Docker only)
+
+Only Kafka runs in Docker; the API, frontend, PostgreSQL, and Redis remain on the host.
+
+```powershell
+docker compose -f docker-compose.kafka.yml up -d
+docker compose -f docker-compose.kafka.yml ps
+Test-NetConnection localhost -Port 9092
+```
+
+Stop Kafka with:
+
+```powershell
+docker compose -f docker-compose.kafka.yml down
+```
+
+Set the Kafka variables in `.env` from `.env.example`, then start the backend and frontend as usual:
+
+```powershell
+npm run dev:api
+npm --prefix web run dev
+npm test
+```
+
+### Current limitations and production path
+
+The application uses the Transactional Outbox Pattern: the domain write and its `outbox_events` row are committed in one PostgreSQL transaction. A relay claims pending rows with `FOR UPDATE SKIP LOCKED`, publishes them to Kafka, and marks them delivered only after Kafka acknowledges the send. A broker outage therefore leaves the event pending for retry rather than losing it. Delivery is at-least-once: a process crash after Kafka acknowledges but before `published_at` is recorded can produce a duplicate, so downstream consumers must remain idempotent using `eventId`.
+
+WebSocket subscriptions are process-local. Kafka consumer groups distribute partitions, but they do not synchronize in-memory socket subscriptions between Node processes. The existing Redis Pub/Sub fan-out still forwards consumer-generated WebSocket messages to each process. For larger-scale deployments, use a dedicated distributed connection/subscription gateway or shared subscription registry, and size consumer instances relative to topic partitions.
 
 ## Performance & Scalability
 
@@ -255,6 +334,7 @@ ws://localhost:8000/ws
 ```json
 {
   "type": "commentary",
+      "matchId": 1,
   "data": {}
 }
 ```
@@ -326,6 +406,8 @@ This avoids expensive `KEYS` scans and allows old cache entries to expire natura
 ### Broadcast and Cache Isolation
 
 Cache invalidation is deliberately **fire-and-forget** and occurs after the WebSocket broadcast.
+
+When the app runs on more than one Node.js process, Redis pub/sub carries websocket events to every process so each connected client receives the same match and commentary broadcasts.
 
 ```text
 Database Write
@@ -434,6 +516,7 @@ A Neon PostgreSQL database can be used for development.
 
 ```bash
 npm install
+npm --prefix web install
 ```
 
 ### 2. Create Environment Variables
@@ -485,10 +568,20 @@ npm run db:generate
 npm run db:migrate
 ```
 
-### 5. Start the API
+The migration creates the `outbox_events` table used for reliable PostgreSQL-to-Kafka publication.
+
+### 5. Start the App
 
 ```bash
 npm run dev
+```
+
+This starts both the backend and the Next.js frontend from the repository root.
+
+To start only the API:
+
+```bash
+npm run dev:api
 ```
 
 Expected output:
@@ -497,7 +590,26 @@ Expected output:
 Redis cache connected
 Server is running at http://localhost:8000
 WebSocket Server is running on ws://localhost:8000/ws
+Next.js running at http://localhost:3000
 ```
+
+### 6. Frontend Only
+
+To run only the frontend:
+
+```bash
+npm --prefix web run dev
+```
+
+If you want the UI to point at a different backend, set `BACKEND_URL` before starting Next.js:
+
+```env
+BACKEND_URL=http://localhost:8000
+```
+
+The app will be available at `http://localhost:3000`.
+
+The frontend is written in **TypeScript** and styled with **Tailwind CSS**.
 
 ## Project Structure
 
@@ -513,6 +625,11 @@ src/
 ├── redis.js                  # Cache connection, reads, and invalidation
 ├── arcjet.js                 # API security configuration
 └── index.js                  # Application bootstrap
+
+web/
+├── app/                      # Next.js App Router pages and API proxies
+├── components/               # Match and commentary UI
+└── lib/                      # Backend URL and formatting helpers
 ```
 
 ## Production Considerations
@@ -520,8 +637,8 @@ src/
 * Keep credentials in `.env`; use `.env.example` only for safe placeholders.
 * Configure `ARCJET_KEY` and enable API protection before deployment.
 * Redis failures fall back to PostgreSQL so cache availability does not make the API unavailable.
-* The WebSocket subscription map is currently process-local.
-* For multiple Node.js instances, introduce **Redis Pub/Sub or a dedicated message broker** to fan out events between instances.
+* The WebSocket subscription map is process-local, while Redis pub/sub fans out events across processes.
+* For multiple Node.js instances, Redis Pub/Sub keeps websocket broadcasts in sync without a separate broker.
 * Configure Redis `maxmemory` based on available deployment resources.
 * Run load tests under realistic network conditions before defining production latency SLOs.
 * Monitor p95/p99 API and WebSocket latency in production.

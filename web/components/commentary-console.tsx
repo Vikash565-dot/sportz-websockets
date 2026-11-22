@@ -1,26 +1,14 @@
-'use client';
-
 import { useEffect, useMemo, useState, useTransition } from "react";
 import { formatDateTime } from "../lib/format";
-
-type Commentary = {
-  id: number;
-  matchId: number;
-  minute?: number;
-  sequence?: number;
-  period?: string;
-  eventType?: string;
-  actor?: string;
-  team?: string;
-  message?: string;
-  createdAt?: string;
-};
+import { getBackendUrl } from "../lib/config";
+import type { Commentary, Match } from "../lib/types";
 
 type CommentaryConsoleProps = {
   matchId: number;
   initialCommentary: Commentary[];
   wsUrl: string;
-  onLiveEvent?: (event: { type: "commentary"; commentary: Commentary } | { type: "match_updated"; match: { id: number; sport: string; homeTeam: string; awayTeam: string; status: string; startTime: string; createdAt?: string; homeScore?: number; awayScore?: number } }) => void;
+  onConnectionChange?: (connected: boolean) => void;
+  onLiveEvent?: (event: { type: "commentary"; commentary: Commentary } | { type: "match_updated"; match: Match }) => void;
 };
 
 type FormState = {
@@ -45,21 +33,22 @@ function normalizeCommentary(items: Commentary[]) {
 }
 
 const initialForm: FormState = {
-  minute: "0",
+  minute: "12",
   sequence: "1",
   period: "1st half",
-  eventType: "update",
-  actor: "Broadcast Desk",
+  eventType: "goal",
+  actor: "Home striker",
   team: "Home",
-  message: "Kickoff sequence is underway.",
-  metadata: "{}",
-  tags: "live,feed",
+  message: "Goal! The home side takes the lead.",
+  metadata: JSON.stringify({ homeScore: 1, awayScore: 0 }, null, 2),
+  tags: "goal,score,live",
 };
 
-export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEvent }: CommentaryConsoleProps) {
+export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onConnectionChange, onLiveEvent }: CommentaryConsoleProps) {
   const initialItems = useMemo(() => normalizeCommentary(initialCommentary || []), [initialCommentary]);
   const [items, setItems] = useState<Commentary[]>(initialItems);
-  const [isConnected, setIsConnected] = useState(false);
+  const [delivery, setDelivery] = useState<Record<number, "stored" | "broadcast">>({});
+  const [socketStatus, setSocketStatus] = useState<"connecting" | "subscribed" | "reconnecting">("connecting");
   const [message, setMessage] = useState("");
   const [isError, setIsError] = useState(false);
   const [isPending, startTransition] = useTransition();
@@ -70,33 +59,53 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
   }, [initialItems]);
 
   useEffect(() => {
-    const socket = new WebSocket(wsUrl);
-
-    socket.addEventListener("open", () => {
-      setIsConnected(true);
-      socket.send(JSON.stringify({ type: "subscribe", matchId }));
-    });
-
-    socket.addEventListener("message", (event) => {
-      try {
-        const payload = JSON.parse(event.data as string) as { type?: string; data?: Commentary; matchId?: number };
-        if (payload.type === "commentary" && payload.matchId === matchId && payload.data) {
-          setItems((current) => normalizeCommentary([payload.data as Commentary, ...current]));
-          onLiveEvent?.({ type: "commentary", commentary: payload.data as Commentary });
+    setSocketStatus("connecting");
+    setDelivery({});
+    let disposed = false;
+    let retries = 0;
+    let socket: WebSocket | undefined;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const connect = () => {
+      if (disposed) return;
+      socket = new WebSocket(wsUrl);
+      socket.addEventListener("open", () => {
+        socket?.send(JSON.stringify({ type: "subscribe", matchId }));
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const payload = JSON.parse(event.data as string) as { type?: string; data?: Commentary | Match; matchId?: number };
+          if (payload.type === "subscribed" && payload.matchId === matchId) {
+            setSocketStatus("subscribed");
+            onConnectionChange?.(true);
+          }
+          if (payload.type === "commentary" && payload.matchId === matchId && payload.data) {
+            const item = payload.data as Commentary;
+            setItems((current) => normalizeCommentary([item, ...current.filter((entry) => entry.id !== item.id)]));
+            setDelivery((current) => ({ ...current, [item.id]: "broadcast" }));
+            onLiveEvent?.({ type: "commentary", commentary: item });
+          }
+          if (payload.type === "match_updated" && payload.data) onLiveEvent?.({ type: "match_updated", match: payload.data as Match });
+        } catch {
+          // Ignore malformed websocket frames from the browser client.
         }
-
-        if (payload.type === "match_updated" && payload.data) {
-          onLiveEvent?.({ type: "match_updated", match: payload.data as never });
+      });
+      socket.addEventListener("close", () => {
+        setSocketStatus("reconnecting");
+        onConnectionChange?.(false);
+        if (!disposed) {
+          retries += 1;
+          retryTimer = setTimeout(connect, Math.min(1000 * 2 ** Math.min(retries - 1, 4), 15000));
         }
-      } catch {
-        // Ignore malformed websocket frames from the browser client.
-      }
-    });
-
-    socket.addEventListener("close", () => setIsConnected(false));
-    socket.addEventListener("error", () => setIsConnected(false));
-
-    return () => socket.close();
+      });
+      socket.addEventListener("error", () => { setSocketStatus("reconnecting"); onConnectionChange?.(false); });
+    };
+    connect();
+    return () => {
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "unsubscribe", matchId }));
+      socket?.close();
+    };
   }, [matchId, wsUrl]);
 
   function updateField<K extends keyof FormState>(field: K, value: FormState[K]) {
@@ -108,7 +117,8 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
 
   function parseMetadata(value: string) {
     try {
-      return value.trim() ? JSON.parse(value) : {};
+      const parsed = value.trim() ? JSON.parse(value) : {};
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
     } catch {
       return null;
     }
@@ -143,7 +153,7 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
             .filter(Boolean),
         };
 
-        const response = await fetch(`/api/matches/${matchId}/commentary`, {
+        const response = await fetch(`${getBackendUrl()}/matches/${matchId}/commentary`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -158,7 +168,8 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
         }
 
         if (body.data) {
-          setItems((current) => normalizeCommentary([body.data as Commentary, ...current]));
+          setItems((current) => normalizeCommentary([body.data as Commentary, ...current.filter((item) => item.id !== body.data?.id)]));
+          setDelivery((current) => current[body.data!.id] === "broadcast" ? current : { ...current, [body.data!.id]: "stored" });
           onLiveEvent?.({ type: "commentary", commentary: body.data as Commentary });
         }
         setMessage("Commentary entry posted.");
@@ -174,8 +185,8 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
     <div className="grid gap-4">
       <div className="panel panel-pad">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <span className={`status ${isConnected ? "live" : "scheduled"}`}>
-            {isConnected ? "connected" : "connecting"}
+          <span className={`status ${socketStatus === "subscribed" ? "live" : "scheduled"}`}>
+            {socketStatus}
           </span>
           <span className="tiny">WebSocket updates automatically append to the feed.</span>
         </div>
@@ -184,39 +195,39 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
           <div className="grid gap-4 md:grid-cols-2">
             <label className="field">
               <span className="field-label">Minute</span>
-              <input className="field-input" type="number" min="0" value={form.minute} onChange={(event) => updateField("minute", event.target.value)} />
+              <input className="field-input" required type="number" min="0" value={form.minute} onChange={(event) => updateField("minute", event.target.value)} />
             </label>
             <label className="field">
               <span className="field-label">Sequence</span>
-              <input className="field-input" type="number" min="1" value={form.sequence} onChange={(event) => updateField("sequence", event.target.value)} />
+              <input className="field-input" required type="number" min="1" value={form.sequence} onChange={(event) => updateField("sequence", event.target.value)} />
             </label>
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">
             <label className="field">
               <span className="field-label">Period</span>
-              <input className="field-input" value={form.period} onChange={(event) => updateField("period", event.target.value)} />
+              <input className="field-input" required value={form.period} onChange={(event) => updateField("period", event.target.value)} />
             </label>
             <label className="field">
               <span className="field-label">Event type</span>
-              <input className="field-input" value={form.eventType} onChange={(event) => updateField("eventType", event.target.value)} />
+              <input className="field-input" required value={form.eventType} onChange={(event) => updateField("eventType", event.target.value)} />
             </label>
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">
             <label className="field">
               <span className="field-label">Actor</span>
-              <input className="field-input" value={form.actor} onChange={(event) => updateField("actor", event.target.value)} />
+              <input className="field-input" required value={form.actor} onChange={(event) => updateField("actor", event.target.value)} />
             </label>
             <label className="field">
               <span className="field-label">Team</span>
-              <input className="field-input" value={form.team} onChange={(event) => updateField("team", event.target.value)} />
+              <input className="field-input" required value={form.team} onChange={(event) => updateField("team", event.target.value)} />
             </label>
           </div>
 
           <label className="field">
             <span className="field-label">Message</span>
-            <textarea className="field-textarea" value={form.message} onChange={(event) => updateField("message", event.target.value)} />
+            <textarea className="field-textarea" required value={form.message} onChange={(event) => updateField("message", event.target.value)} />
           </label>
 
           <div className="grid gap-4 md:grid-cols-2">
@@ -231,13 +242,13 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <span className="tiny">POST /api/matches/{matchId}/commentary proxies to the backend.</span>
+            <span className="tiny">POST /matches/{matchId}/commentary sends this update to the backend.</span>
             <button className="btn-primary" type="submit" disabled={isPending}>
               {isPending ? "Posting..." : "Post commentary"}
             </button>
           </div>
 
-          {message ? <div className={isError ? "message-error" : "message-success"}>{message}</div> : null}
+          {message ? <div className={isError ? "message-error" : "message-success"} role={isError ? "alert" : "status"}>{message}</div> : null}
         </form>
       </div>
 
@@ -249,7 +260,9 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
                 <span>
                   {item.period} · {item.eventType}
                 </span>
-                <span>
+                <span className="flex items-center gap-2">
+                  {delivery[item.id] === "broadcast" && <span className="tag bg-[#dff3e5]">broadcast</span>}
+                  {delivery[item.id] === "stored" && <span className="tag bg-[#fff0c2]">saved · waiting for broadcast</span>}
                   {item.minute != null ? `${item.minute}'` : ""}
                   {item.sequence != null ? ` #${item.sequence}` : ""}
                 </span>
@@ -259,6 +272,10 @@ export function CommentaryConsole({ matchId, initialCommentary, wsUrl, onLiveEve
                 <span className="tag">{item.actor}</span>
                 <span className="tag">{item.team}</span>
                 <span className="tag">{formatDateTime(item.createdAt)}</span>
+                {item.tags?.map((tag) => <span className="tag" key={tag}>{tag}</span>)}
+                {(Number.isFinite(Number(item.metadata?.homeScore)) || Number.isFinite(Number(item.metadata?.awayScore))) && (
+                  <span className="tag bg-[#f5d447]">Score metadata · {item.metadata?.homeScore == null ? "–" : String(item.metadata.homeScore)} : {item.metadata?.awayScore == null ? "–" : String(item.metadata.awayScore)}</span>
+                )}
               </div>
             </article>
           ))
