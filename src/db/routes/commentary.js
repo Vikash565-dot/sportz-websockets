@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { db } from "../db.js";
-import { commentary } from "../schema.js";
+import { commentary, matches } from "../schema.js";
 import { matchIdParamSchema as matchParamSchema } from "../../validation/matches.js";
 import {
     createCommentarySchema,
@@ -12,6 +12,10 @@ import {
     getCacheVersion,
     getOrSetJson,
 } from "../../redis.js";
+import { getMatchStatus } from "../../utils/match-status.js";
+import { createCommentaryInStore, listCommentary } from "../fallback-store.js";
+import { commentaryCreatedEvent, matchUpdatedEvent } from "../../kafka/events.js";
+import { enqueueOutboxEvent, flushOutboxEvents } from "../../kafka/outbox.js";
 
 export const commentaryRouter = Router({ mergeParams: true });
 
@@ -44,14 +48,19 @@ commentaryRouter.get("/", async (req, res) => {
     try {
         const version = await getCacheVersion(`commentary:match:${matchId}`);
         const cacheKey = `commentary:match:${matchId}:v${version}:limit:${limit}`;
-        const { data, cacheStatus } = await getOrSetJson(cacheKey, commentaryCacheTtl, () =>
-            db
-                .select()
-                .from(commentary)
-                .where(eq(commentary.matchId, matchId))
-                .orderBy(desc(commentary.createdAt))
-                .limit(limit)
-        );
+        const { data, cacheStatus } = await getOrSetJson(cacheKey, commentaryCacheTtl, async () => {
+            try {
+                return await db
+                    .select()
+                    .from(commentary)
+                    .where(eq(commentary.matchId, matchId))
+                    .orderBy(desc(commentary.createdAt))
+                    .limit(limit);
+            } catch (dbError) {
+                console.warn("Database unavailable for commentary, using fallback store", dbError.message);
+                return listCommentary(matchId, limit);
+            }
+        });
 
         res.set("X-Cache", cacheStatus);
         return res.json({ data });
@@ -90,11 +99,66 @@ commentaryRouter.post("/", async (req, res) => {
     } = bodyResult.data;
 
     try {
-        const [entry] = await db
-            .insert(commentary)
-            .values({
-                matchId,
-                minute: minute,
+        let entry;
+        let updatedMatch = null;
+        let persistedInPostgres = true;
+
+        try {
+            ({ entry, updatedMatch } = await db.transaction(async (tx) => {
+                const [createdCommentary] = await tx
+                    .insert(commentary)
+                    .values({
+                        matchId,
+                        minute,
+                        sequence,
+                        period,
+                        eventType,
+                        actor,
+                        team,
+                        message,
+                        metadata,
+                        tags,
+                    })
+                    .returning();
+
+                const scoreUpdates = {};
+                const homeScore = Number(metadata?.homeScore);
+                const awayScore = Number(metadata?.awayScore);
+
+                if (Number.isFinite(homeScore)) scoreUpdates.homeScore = homeScore;
+                if (Number.isFinite(awayScore)) scoreUpdates.awayScore = awayScore;
+
+                const [currentMatch] = await tx
+                    .select()
+                    .from(matches)
+                    .where(eq(matches.id, matchId))
+                    .limit(1);
+
+                if (currentMatch) {
+                    const nextStatus = getMatchStatus(currentMatch.startTime, currentMatch.endTime);
+                    if (nextStatus && nextStatus !== currentMatch.status) scoreUpdates.status = nextStatus;
+                }
+
+                let changedMatch = null;
+                if (Object.keys(scoreUpdates).length > 0) {
+                    [changedMatch] = await tx
+                        .update(matches)
+                        .set(scoreUpdates)
+                        .where(eq(matches.id, matchId))
+                        .returning();
+                }
+
+                const eventMatch = changedMatch ?? currentMatch ?? { id: matchId, sport: "unknown" };
+                await enqueueOutboxEvent(tx, commentaryCreatedEvent(eventMatch, createdCommentary));
+                if (changedMatch) await enqueueOutboxEvent(tx, matchUpdatedEvent(changedMatch));
+
+                return { entry: createdCommentary, updatedMatch: changedMatch };
+            }));
+        } catch (dbError) {
+            console.warn("Database unavailable for commentary insert, using fallback store", dbError.message);
+            persistedInPostgres = false;
+            ({ entry } = await createCommentaryInStore(matchId, {
+                minute,
                 sequence,
                 period,
                 eventType,
@@ -103,15 +167,21 @@ commentaryRouter.post("/", async (req, res) => {
                 message,
                 metadata,
                 tags,
-            })
-            .returning();
+            }));
+        }
 
-        if (res.app.locals.broadcastCommentary) {
-            res.app.locals.broadcastCommentary(entry.matchId, entry);
+        if (persistedInPostgres) {
+            void flushOutboxEvents().catch((error) => console.error("Outbox flush failed:", error.message));
+        } else if (res.app.locals.broadcastCommentary) {
+            await res.app.locals.broadcastCommentary(entry.matchId, entry);
+            if (updatedMatch && res.app.locals.broadcastMatchUpdated) {
+                await res.app.locals.broadcastMatchUpdated(updatedMatch);
+            }
         }
 
         // Cache invalidation must not add latency to the live WebSocket event path.
         void bumpCacheVersion(`commentary:match:${matchId}`);
+        void bumpCacheVersion("matches:list");
 
         return res.status(201).json({ data: entry });
     } catch (e) {

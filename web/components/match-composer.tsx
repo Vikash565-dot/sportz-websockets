@@ -1,6 +1,6 @@
-'use client';
-
-import { useState, useTransition } from "react";
+import { useState } from "react";
+import { getBackendUrl } from "../lib/config";
+import type { Match } from "../lib/types";
 
 type FormState = {
   sport: string;
@@ -12,21 +12,28 @@ type FormState = {
   awayScore: number;
 };
 
-const initialState: FormState = {
-  sport: "Cricket",
-  homeTeam: "Mumbai Meteors",
-  awayTeam: "Delhi Strikers",
-  startTime: new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 16),
-  endTime: new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 16),
-  homeScore: 0,
-  awayScore: 0,
-};
+function toLocalDateTime(date: Date) {
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
 
-export function MatchComposer() {
-  const [form, setForm] = useState<FormState>(initialState);
+function makeInitialState(): FormState {
+  return {
+    sport: "Football",
+    homeTeam: "Mumbai City FC",
+    awayTeam: "Bengaluru FC",
+    startTime: toLocalDateTime(new Date(Date.now() - 10 * 60 * 1000)),
+    endTime: toLocalDateTime(new Date(Date.now() + 90 * 60 * 1000)),
+    homeScore: 0,
+    awayScore: 0,
+  };
+}
+
+export function MatchComposer({ onCreated }: { onCreated?: (match: Match) => void }) {
+  const [form, setForm] = useState<FormState>(makeInitialState);
   const [message, setMessage] = useState("");
   const [isError, setIsError] = useState(false);
-  const [isPending, startTransition] = useTransition();
+  const [isPending, setIsPending] = useState(false);
 
   function updateField<K extends keyof FormState>(field: K, value: FormState[K]) {
     setForm((current) => ({
@@ -39,10 +46,14 @@ export function MatchComposer() {
     event.preventDefault();
     setMessage("");
     setIsError(false);
-
-    startTransition(async () => {
-      try {
-        const response = await fetch("/api/matches", {
+    if (new Date(form.endTime) <= new Date(form.startTime)) {
+      setIsError(true);
+      setMessage("The end time must be after the start time.");
+      return;
+    }
+    setIsPending(true);
+    try {
+        const response = await fetch(`${getBackendUrl()}/matches`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -64,13 +75,16 @@ export function MatchComposer() {
           throw new Error(payload?.error || "Failed to create match");
         }
 
-        setMessage(`Created match #${payload?.data?.id}. Refresh the page to see it in the list.`);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "Failed to create match";
-        setIsError(true);
-        setMessage(errorMessage);
-      }
-    });
+        const createdMatch = payload?.data as Match | undefined;
+        if (createdMatch) onCreated?.(createdMatch);
+        setMessage(createdMatch ? `Match #${createdMatch.id} created. Select it above to subscribe to its broadcast.` : "Match created.");
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Failed to create match";
+      setIsError(true);
+      setMessage(errorMessage);
+    } finally {
+      setIsPending(false);
+    }
   }
 
   return (
@@ -79,29 +93,29 @@ export function MatchComposer() {
         <div className="grid gap-4 md:grid-cols-2">
           <label className="field">
             <span className="field-label">Sport</span>
-            <input className="field-input" value={form.sport} onChange={(event) => updateField("sport", event.target.value)} />
+            <input className="field-input" required value={form.sport} onChange={(event) => updateField("sport", event.target.value)} />
           </label>
           <label className="field">
             <span className="field-label">Home team</span>
-            <input className="field-input" value={form.homeTeam} onChange={(event) => updateField("homeTeam", event.target.value)} />
+            <input className="field-input" required value={form.homeTeam} onChange={(event) => updateField("homeTeam", event.target.value)} />
           </label>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
           <label className="field">
             <span className="field-label">Away team</span>
-            <input className="field-input" value={form.awayTeam} onChange={(event) => updateField("awayTeam", event.target.value)} />
+            <input className="field-input" required value={form.awayTeam} onChange={(event) => updateField("awayTeam", event.target.value)} />
           </label>
           <label className="field">
             <span className="field-label">Start time</span>
-            <input className="field-input" type="datetime-local" value={form.startTime} onChange={(event) => updateField("startTime", event.target.value)} />
+            <input className="field-input" required type="datetime-local" value={form.startTime} onChange={(event) => updateField("startTime", event.target.value)} />
           </label>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
           <label className="field">
             <span className="field-label">End time</span>
-            <input className="field-input" type="datetime-local" value={form.endTime} onChange={(event) => updateField("endTime", event.target.value)} />
+            <input className="field-input" required type="datetime-local" value={form.endTime} onChange={(event) => updateField("endTime", event.target.value)} />
           </label>
           <label className="field">
             <span className="field-label">Home score</span>
@@ -116,20 +130,20 @@ export function MatchComposer() {
           </label>
           <div className="field">
             <span className="field-label">Preview</span>
-            <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+            <div className="rounded-2xl border-[2px] border-[#202020] bg-[#f5d447] px-4 py-3 text-sm font-semibold text-[#202020]">
               {form.homeTeam} vs {form.awayTeam} | {form.sport}
             </div>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="tiny">POST /api/matches proxies to the backend match endpoint.</span>
+          <span className="tiny">POST /matches sends this fixture to the backend.</span>
           <button className="btn-primary" type="submit" disabled={isPending}>
             {isPending ? "Creating..." : "Create match"}
           </button>
         </div>
 
-        {message ? <div className={isError ? "message-error" : "message-success"}>{message}</div> : null}
+        {message ? <div className={isError ? "message-error" : "message-success"} role={isError ? "alert" : "status"}>{message}</div> : null}
       </form>
     </div>
   );

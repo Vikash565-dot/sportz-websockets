@@ -1,36 +1,9 @@
-'use client';
-
-import Link from "next/link";
+import { Link } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
-import { formatDateTime, formatRelativeTime } from "../lib/format";
+import { formatDateTime, formatMatchTiming } from "../lib/format";
+import type { Commentary, Match } from "../lib/types";
 
-type Match = {
-  id: number;
-  sport: string;
-  homeTeam: string;
-  awayTeam: string;
-  status: string;
-  startTime: string;
-  createdAt?: string;
-  homeScore?: number;
-  awayScore?: number;
-};
-
-type Commentary = {
-  id: number;
-  matchId: number;
-  minute?: number;
-  sequence?: number;
-  period?: string;
-  eventType?: string;
-  actor?: string;
-  team?: string;
-  message?: string;
-  metadata?: Record<string, unknown>;
-  createdAt?: string;
-};
-
-type SocketStatus = "idle" | "connecting" | "subscribed" | "closed" | "error";
+type SocketStatus = "idle" | "connecting" | "subscribed" | "closed" | "error" | "reconnecting";
 
 function sortMatches(matches: Match[]) {
   return [...matches].sort((left, right) => {
@@ -61,6 +34,7 @@ function statusLabel(status: SocketStatus) {
   if (status === "connecting") return "connecting";
   if (status === "error") return "connection error";
   if (status === "closed") return "disconnected";
+  if (status === "reconnecting") return "reconnecting";
   return "select match";
 }
 
@@ -99,7 +73,7 @@ function MatchButton({
           <div className="text-center text-sm text-[#666]">
             <div className="font-semibold uppercase tracking-[0.14em]">Starts</div>
             <div className="text-[#202020]">{formatDateTime(match.startTime)}</div>
-            <div>{formatRelativeTime(match.startTime)} away</div>
+            <div>{formatMatchTiming(match.startTime, match.status)}</div>
           </div>
           <div className="justify-self-end space-y-2 text-right">
             <div className="score">{match.awayScore ?? 0}</div>
@@ -110,7 +84,7 @@ function MatchButton({
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <span className="text-sm font-medium text-[#555]">{isSelected ? "Subscribed on the right panel." : "Click to subscribe via pub/sub."}</span>
-        <Link className="btn-secondary" href={`/matches/${match.id}`}>
+        <Link className="btn-secondary" to={`/matches/${match.id}`}>
           Open match
         </Link>
       </div>
@@ -118,11 +92,21 @@ function MatchButton({
   );
 }
 
-export function MatchSubscriptionBoard({ initialMatches, wsUrl }: { initialMatches: Match[]; wsUrl: string }) {
+export function MatchSubscriptionBoard({ initialMatches, wsUrl, onMatchEvent, focusMatchId }: { initialMatches: Match[]; wsUrl: string; onMatchEvent?: (match: Match) => void; focusMatchId?: number | null }) {
   const [matches, setMatches] = useState(() => sortMatches(initialMatches));
   const [selectedId, setSelectedId] = useState<number | null>(initialMatches[0]?.id ?? null);
   const [socketStatus, setSocketStatus] = useState<SocketStatus>(initialMatches[0] ? "connecting" : "idle");
   const [liveCommentary, setLiveCommentary] = useState<Commentary[]>([]);
+
+  useEffect(() => {
+    const sortedMatches = sortMatches(initialMatches);
+    setMatches(sortedMatches);
+    setSelectedId((current) => current ?? sortedMatches[0]?.id ?? null);
+  }, [initialMatches]);
+
+  useEffect(() => {
+    if (focusMatchId != null) setSelectedId(focusMatchId);
+  }, [focusMatchId]);
 
   const selectedMatch = useMemo(() => matches.find((match) => match.id === selectedId) ?? null, [matches, selectedId]);
   const liveCount = matches.filter((match) => match.status === "live").length;
@@ -136,57 +120,70 @@ export function MatchSubscriptionBoard({ initialMatches, wsUrl }: { initialMatch
     setSocketStatus("connecting");
     setLiveCommentary([]);
 
-    const socket = new WebSocket(wsUrl);
+    let disposed = false;
+    let retries = 0;
+    let socket: WebSocket | undefined;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
-    socket.addEventListener("open", () => {
-      socket.send(JSON.stringify({ type: "subscribe", matchId: selectedMatch.id }));
-    });
+    const connect = () => {
+      if (disposed) return;
+      setSocketStatus(retries > 0 ? "reconnecting" : "connecting");
+      socket = new WebSocket(wsUrl);
 
-    socket.addEventListener("message", (event) => {
-      try {
-        const payload = JSON.parse(event.data as string) as {
-          type?: string;
-          matchId?: number;
-          data?: Match | Commentary;
-        };
+      socket.addEventListener("open", () => {
+        socket?.send(JSON.stringify({ type: "subscribe", matchId: selectedMatch.id }));
+      });
 
-        if (payload.type === "subscribed" && payload.matchId === selectedMatch.id) {
-          setSocketStatus("subscribed");
-          return;
+      socket.addEventListener("message", (event) => {
+        try {
+          const payload = JSON.parse(event.data as string) as { type?: string; matchId?: number; data?: Match | Commentary };
+          if (payload.type === "subscribed" && payload.matchId === selectedMatch.id) {
+            setSocketStatus("subscribed");
+            return;
+          }
+          if (payload.type === "match_created" && payload.data) {
+            const match = payload.data as Match;
+            setMatches((current) => upsertMatch(current, match));
+            onMatchEvent?.(match);
+            return;
+          }
+          if (payload.type === "match_updated" && payload.data) {
+            const match = payload.data as Match;
+            setMatches((current) => upsertMatch(current, match));
+            onMatchEvent?.(match);
+            return;
+          }
+          if (payload.type === "commentary" && payload.matchId === selectedMatch.id && payload.data) {
+            const commentary = payload.data as Commentary;
+            setLiveCommentary((current) => [commentary, ...current.filter((item) => item.id !== commentary.id)].slice(0, 8));
+            const updatedMatch = applyScoreFromCommentary(selectedMatch, commentary);
+            setMatches((current) => current.map((match) => match.id === selectedMatch.id ? applyScoreFromCommentary(match, commentary) : match));
+            onMatchEvent?.(updatedMatch);
+          }
+        } catch {
+          // Ignore malformed websocket frames from the browser client.
         }
+      });
 
-        if (payload.type === "match_created" && payload.data) {
-          setMatches((current) => upsertMatch(current, payload.data as Match));
-          return;
-        }
-
-        if (payload.type === "match_updated" && payload.data) {
-          setMatches((current) => upsertMatch(current, payload.data as Match));
-          return;
-        }
-
-        if (payload.type === "commentary" && payload.matchId === selectedMatch.id && payload.data) {
-          const commentary = payload.data as Commentary;
-          setLiveCommentary((current) => [commentary, ...current].slice(0, 8));
-          setMatches((current) =>
-            current.map((match) => (match.id === selectedMatch.id ? applyScoreFromCommentary(match, commentary) : match)),
-          );
-        }
-      } catch {
-        // Ignore malformed websocket frames from the browser client.
-      }
-    });
-
-    socket.addEventListener("close", () => setSocketStatus("closed"));
-    socket.addEventListener("error", () => setSocketStatus("error"));
+      socket.addEventListener("close", () => {
+        if (disposed) return;
+        setSocketStatus("closed");
+        retries += 1;
+        retryTimer = setTimeout(connect, Math.min(1000 * 2 ** Math.min(retries - 1, 4), 15000));
+      });
+      socket.addEventListener("error", () => { if (!disposed) setSocketStatus("error"); });
+    };
+    connect();
 
     return () => {
-      if (socket.readyState === WebSocket.OPEN) {
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (socket?.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "unsubscribe", matchId: selectedMatch.id }));
       }
-      socket.close();
+      socket?.close();
     };
-  }, [selectedMatch?.id, wsUrl]);
+  }, [selectedMatch?.id, wsUrl, onMatchEvent]);
 
   return (
     <section className="mt-6 grid gap-5 lg:grid-cols-[minmax(0,1fr)_340px]">
@@ -201,7 +198,7 @@ export function MatchSubscriptionBoard({ initialMatches, wsUrl }: { initialMatch
         <div className="mb-4 rounded-[24px] border-[3px] border-[#202020] bg-[#f5d447] px-4 py-3 shadow-[4px_5px_0_0_rgba(0,0,0,0.9)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="font-display text-lg font-black text-[#202020]">{liveCount} live matches ready for subscription</div>
-            <span className="tag bg-white">Redis pub/sub safe</span>
+              <span className="tag bg-white">Redis · WebSocket fan-out</span>
           </div>
         </div>
 
@@ -264,7 +261,7 @@ export function MatchSubscriptionBoard({ initialMatches, wsUrl }: { initialMatch
               )}
             </div>
 
-            <Link className="btn-primary mt-5" href={`/matches/${selectedMatch.id}`}>
+            <Link className="btn-primary mt-5" to={`/matches/${selectedMatch.id}`}>
               Open full live console
             </Link>
           </div>

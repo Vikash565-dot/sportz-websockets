@@ -8,7 +8,11 @@ import { matchesRouter } from "./db/routes/matches.js";
 import { attachWebSocketServer } from "./ws/server.js";
 import { commentaryRouter } from "./db/routes/commentary.js";
 import { securityMiddleware } from "./arcjet.js";
-import { connectRedis } from "./redis.js";
+import { connectRedis, disconnectRedis } from "./redis.js";
+import { startMatchEventConsumer, disconnectKafkaConsumer } from "./kafka/consumer.js";
+import { disconnectKafkaProducer, initializeKafkaProducer } from "./kafka/producer.js";
+import { startOutboxRelay, stopOutboxRelay } from "./kafka/outbox.js";
+import { pool } from "./db/db.js";
 
 const PORT = Number(process.env.PORT || 8000);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -37,14 +41,55 @@ app.use('/matches', matchesRouter);
 
 app.use('/matches/:id/commentary', commentaryRouter)
 
-const { broadcastMatchCreated, broadcastCommentary } = attachWebSocketServer(server);
+const { broadcastMatchCreated, broadcastMatchUpdated, broadcastCommentary, closeWebSocketServer } = attachWebSocketServer(server);
 app.locals.broadcastMatchCreated = broadcastMatchCreated;
+app.locals.broadcastMatchUpdated = broadcastMatchUpdated;
 app.locals.broadcastCommentary = broadcastCommentary;
 
-await connectRedis();
+void connectRedis();
+void (async () => {
+    const producerReady = await initializeKafkaProducer();
+    if (!producerReady) return;
+
+    startOutboxRelay();
+
+    await startMatchEventConsumer(async (event) => {
+        if (event.eventType === "MATCH_CREATED" && event.payload.match) {
+            await broadcastMatchCreated(event.payload.match);
+            return;
+        }
+
+        if (event.eventType === "COMMENTARY_CREATED" && event.payload.commentary) {
+            await broadcastCommentary(Number(event.matchId), event.payload.commentary);
+            return;
+        }
+
+        if (event.eventType === "MATCH_UPDATED" && event.payload.match) {
+            await broadcastMatchUpdated(event.payload.match);
+            return;
+        }
+
+        console.error(`Ignoring Kafka match event with unsupported payload: ${event.eventType}`);
+    });
+})();
 
 server.listen(PORT, HOST, () => {
     const baseUrl = HOST === '0.0.0.0' ? `http://localhost:${PORT}` : `http://${HOST}:${PORT}`;
     console.log(`Server is running at ${baseUrl}`);
     console.log(`webSocket Server is running on ${baseUrl.replace('http', 'ws')}/ws`);
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received; shutting down gracefully.`);
+    await closeWebSocketServer();
+    await new Promise((resolve) => server.close(resolve));
+    stopOutboxRelay();
+    await Promise.allSettled([disconnectKafkaConsumer(), disconnectKafkaProducer(), disconnectRedis(), pool.end()]);
+    process.exit(0);
+}
+
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));

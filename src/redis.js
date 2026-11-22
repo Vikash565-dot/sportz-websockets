@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createClient } from "redis";
 
 const redisUrl = process.env.REDIS_URL;
+const wsEventsChannel = "sportz:ws-events";
 
 export const redis = redisUrl
   ? createClient({
@@ -13,11 +14,45 @@ export const redis = redisUrl
     })
   : null;
 
+  export const redisPubSubPublisher = redisUrl
+    ? createClient({
+        url: redisUrl,
+        socket: {
+          connectTimeout: 1_000,
+          reconnectStrategy: false,
+        },
+      })
+    : null;
+
+  export const redisPubSubSubscriber = redisUrl
+    ? createClient({
+        url: redisUrl,
+        socket: {
+          connectTimeout: 1_000,
+          reconnectStrategy: false,
+        },
+      })
+    : null;
+
+  let wsEventsSubscribed = false;
+
 if (redis) {
   redis.on("error", (error) => {
     console.error("Redis error:", error.message);
   });
 }
+
+  if (redisPubSubPublisher) {
+    redisPubSubPublisher.on("error", (error) => {
+      console.error("Redis pub/sub publisher error:", error.message);
+    });
+  }
+
+  if (redisPubSubSubscriber) {
+    redisPubSubSubscriber.on("error", (error) => {
+      console.error("Redis pub/sub subscriber error:", error.message);
+    });
+  }
 
 export async function connectRedis() {
   if (!redis || redis.isOpen) return false;
@@ -30,6 +65,49 @@ export async function connectRedis() {
     console.error("Redis cache disabled:", error.message);
     return false;
   }
+}
+
+export async function connectRedisPubSub(onMessage) {
+  if (!redisPubSubPublisher || !redisPubSubSubscriber) return false;
+
+  try {
+    if (!redisPubSubPublisher.isOpen) {
+      await redisPubSubPublisher.connect();
+    }
+
+    if (!redisPubSubSubscriber.isOpen) {
+      await redisPubSubSubscriber.connect();
+    }
+
+    if (onMessage && !wsEventsSubscribed) {
+      await redisPubSubSubscriber.subscribe(wsEventsChannel, onMessage);
+      wsEventsSubscribed = true;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Redis pub/sub disabled:", error.message);
+    return false;
+  }
+}
+
+export async function publishWsEvent(event) {
+  if (!redisPubSubPublisher?.isOpen) return false;
+
+  try {
+    await redisPubSubPublisher.publish(wsEventsChannel, JSON.stringify(event));
+    return true;
+  } catch (error) {
+    console.error("Failed to publish websocket event:", error.message);
+    return false;
+  }
+}
+
+export async function disconnectRedis() {
+  const clients = [redis, redisPubSubPublisher, redisPubSubSubscriber].filter((client) => client?.isOpen);
+  await Promise.all(
+    clients.map((client) => client.quit().catch((error) => console.error("Redis disconnect failed:", error.message))),
+  );
 }
 
 export async function getCacheVersion(scope) {
